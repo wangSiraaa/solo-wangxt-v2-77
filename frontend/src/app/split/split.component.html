@@ -1,0 +1,148 @@
+<div class="panel">
+  <h2>拆分参数</h2>
+  <div class="grid">
+    <div>
+      <label>时间分界（日期）</label>
+      <input type="date" [(ngModel)]="cutoffDate" />
+    </div>
+    <div>
+      <label>主体字段</label>
+      <input type="text" value="subject_id" disabled />
+    </div>
+    <div>
+      <label>目标评测集比例</label>
+      <input type="number" min="0" max="1" step="0.05" [(ngModel)]="targetRatio" />
+    </div>
+    <div>
+      <label>随机种子（可复现）</label>
+      <input type="number" min="0" [(ngModel)]="seed" />
+    </div>
+    <div>
+      <label>跨月份主体处理策略</label>
+      <select [(ngModel)]="policy">
+        <option value="exclude">隔离剔除（推荐）</option>
+        <option value="eval">强制归入评测</option>
+        <option value="train">强制归入训练（破坏时间条件）</option>
+      </select>
+    </div>
+  </div>
+  <div class="actions">
+    <button (click)="run()">生成拆分预览</button>
+    <span class="muted">同一主体只会出现在一个集合；未知来源关系仅被隔离，不会被宣称为“已消除泄漏”。</span>
+  </div>
+  <div class="alert bad" *ngIf="error()" style="margin-top:12px">{{ error() }}</div>
+</div>
+
+<ng-container *ngIf="result() as r">
+  <div class="panel">
+    <h2>核查结论</h2>
+
+    <div class="alert ok" *ngIf="r.stats.assertions['subject_isolation']">
+      ✓ 主体隔离成立：每个已知主体只出现在训练集或评测集中的一侧。
+    </div>
+    <div class="alert bad" *ngIf="!r.stats.assertions['subject_isolation']">
+      ✗ 主体隔离失败：存在同一主体同时进入训练集与评测集。
+    </div>
+
+    <div class="alert ok" *ngIf="r.stats.assertions['train_before_cutoff_only']">
+      ✓ 时间条件成立：训练集不含分界当日及之后的样本。
+    </div>
+    <div class="alert bad" *ngIf="!r.stats.assertions['train_before_cutoff_only']">
+      ✗ 时间条件被破坏：训练集包含 {{ r.stats.time_condition['train_samples_after_cutoff'] }} 个分界后样本（策略所致）。
+    </div>
+
+    <div class="alert warn" *ngIf="r.stats.unresolved_relationships > 0">
+      ⚠ {{ r.stats.unresolved_relationships }} 个样本来源关系未知（缺来源 / 来源成环 / 无主体），已全部隔离。
+      未知关系只能被隔离，无法被证明“不存在泄漏”，上线前需人工补齐来源。
+    </div>
+
+    <div class="cards" style="margin-top:12px">
+      <div class="card"><div class="num">{{ r.stats.train_samples }}</div><div class="lbl">训练样本</div></div>
+      <div class="card"><div class="num">{{ r.stats.eval_samples }}</div><div class="lbl">评测样本</div></div>
+      <div class="card"><div class="num">{{ r.stats.excluded_samples }}</div><div class="lbl">隔离样本</div></div>
+      <div class="card"><div class="num">{{ r.stats.cutoff_crossing_subjects }}</div><div class="lbl">跨月份主体</div></div>
+      <div class="card">
+        <div class="num" [class.diff-pos]="r.stats.ratio_diff !== 0" [class.diff-zero]="r.stats.ratio_diff === 0">
+          {{ pct(r.stats.actual_eval_ratio) }}
+        </div>
+        <div class="lbl">
+          实际评测比例（目标 {{ pct(r.stats.target_eval_ratio) }}，
+          差异 <span [class]="diffClass(r.stats.ratio_diff)">{{ r.stats.ratio_diff > 0 ? '+' : '' }}{{ pct(r.stats.ratio_diff) }}</span>）
+        </div>
+      </div>
+      <div class="card"><div class="num">{{ r.stats.seed }}</div><div class="lbl">已使用随机种子</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>各类别实际比例 vs 目标</h2>
+    <table>
+      <thead>
+        <tr><th>类别</th><th>样本数</th><th>训练</th><th>评测</th><th>目标评测比例</th><th>实际评测比例</th><th>差异</th></tr>
+      </thead>
+      <tbody>
+        <tr *ngFor="let e of labelEntries()">
+          <td>{{ e.label }}</td>
+          <td>{{ e.p.total }}</td>
+          <td>{{ e.p.train }}</td>
+          <td>{{ e.p.eval }}</td>
+          <td>{{ pct(e.p.target_eval_ratio) }}</td>
+          <td>{{ pct(e.p.actual_eval_ratio) }}</td>
+          <td [class]="diffClass(e.p.diff)">
+            {{ e.p.diff > 0 ? '+' : '' }}{{ (e.p.diff * 100).toFixed(1) }} 个百分点
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="muted" *ngFor="let n of r.stats.notes" style="margin:6px 0 0">
+      备注：{{ n }}
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>每个样本的归属与冲突原因</h2>
+    <div class="actions" style="margin-top:0">
+      <button class="ghost" [class]="filter()==='all' ? '' : 'ghost'" (click)="filter.set('all')">全部 ({{ r.assignments.length }})</button>
+      <button class="ghost" (click)="filter.set('train')">训练 ({{ r.stats.train_samples }})</button>
+      <button class="ghost" (click)="filter.set('eval')">评测 ({{ r.stats.eval_samples }})</button>
+      <button class="ghost" (click)="filter.set('excluded')">隔离 ({{ r.stats.excluded_samples }})</button>
+      <span style="flex:1"></span>
+      <button (click)="confirm()" [disabled]="confirmed()">
+        {{ confirmed() ? '已确认并保存清单与种子' : '确认方案：保存清单与随机种子' }}
+      </button>
+    </div>
+    <div class="alert ok" *ngIf="confirmed()" style="margin-top:10px">
+      方案 {{ r.plan_id.slice(0, 8) }} 已确认，样本归属与种子 {{ r.stats.seed }} 已持久化，可在“已保存方案”中查看。
+    </div>
+    <div class="table-wrap" style="margin-top:10px">
+      <table>
+        <thead>
+          <tr>
+            <th>样本</th><th>归属</th><th>有效主体（继承后）</th><th>类别</th>
+            <th>采集时间</th><th>原因 / 说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let a of filteredAssignments()">
+            <td>
+              {{ a.sample_code }}
+              <span class="chip" *ngIf="a.inherited">派生·继承</span>
+            </td>
+            <td><span class="badge" [class]="a.assignment">{{
+              a.assignment === 'train' ? '训练' : a.assignment === 'eval' ? '评测' : '隔离'
+            }}</span></td>
+            <td>{{ a.effective_subject_key ?? '— 未知 —' }}</td>
+            <td>{{ a.label }}</td>
+            <td>{{ a.collected_at.replace('T', ' ').slice(0, 16) }}</td>
+            <td>
+              <span *ngIf="a.reasons.length === 0" class="muted">按种子分层分配</span>
+              <span *ngFor="let reason of a.reasons" [class]="reasonClass(reason)" class="chip">
+                {{ reasonOf(reason) }}
+              </span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</ng-container>
