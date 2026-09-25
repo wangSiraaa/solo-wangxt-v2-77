@@ -1,0 +1,242 @@
+<div class="page">
+  <header>
+    <h1>LeakGuard 样本拆分核查</h1>
+    <p class="subtitle">
+      按时间分界与主体字段拆分训练/评测集 · 同一主体只进一个集合 ·
+      派生样本继承原始来源身份 · 缺来源单独隔离
+    </p>
+  </header>
+
+  @if (error) {
+    <div class="banner error">{{ error }}</div>
+  }
+
+  <section class="card">
+    <h2>1. 拆分参数</h2>
+    <div class="form-grid">
+      <label>
+        时间分界 cutoff
+        <input type="date" [(ngModel)]="cutoff" />
+      </label>
+      <label>
+        主体字段
+        <select [(ngModel)]="subjectField">
+          <option value="subject_id">subject_id</option>
+        </select>
+      </label>
+      <label>
+        时间模式
+        <select [(ngModel)]="timeMode">
+          <option value="hard">hard（严格按时间，跨边界主体单侧锁定）</option>
+          <option value="grouped_stratify">grouped_stratify（分组分层逼近比例）</option>
+        </select>
+      </label>
+      <label>
+        跨边界策略
+        <select [(ngModel)]="straddlePolicy">
+          <option value="train_lock">train_lock（保留训练侧，剔除边界后样本）</option>
+          <option value="eval_lock">eval_lock（保留评测侧，剔除边界前样本）</option>
+        </select>
+      </label>
+      <label>
+        默认目标评测比例
+        <input type="number" min="0" max="1" step="0.05" [(ngModel)]="defaultRatio" />
+      </label>
+      <label>
+        罕见类别名
+        <input type="text" [(ngModel)]="rareClass" />
+      </label>
+      <label>
+        罕见类别目标评测比例
+        <input type="number" min="0" max="1" step="0.05" [(ngModel)]="rareRatio" />
+      </label>
+      <label>
+        随机种子（留空则随机生成）
+        <input type="number" [(ngModel)]="seed" />
+      </label>
+    </div>
+    <div class="actions">
+      <button class="primary" [disabled]="loading" (click)="preview()">
+        {{ loading ? '计算中…' : '生成拆分预览' }}
+      </button>
+      <span class="hint">预览不代表最终确认；检查无误后再确认保存清单与种子。</span>
+    </div>
+  </section>
+
+  @if (result) {
+    <section class="card">
+      <h2>2. 分桶汇总 <span class="tag">run #{{ result.run_id }} · {{ result.status }}</span></h2>
+      <div class="buckets">
+        @for (b of ['train', 'eval', 'excluded', 'unresolved']; track b) {
+          <div class="bucket" [class]="b">
+            <div class="bucket-num">{{ bucketCounts[b] ?? 0 }}</div>
+            <div class="bucket-name">{{ bucketLabel(b) }}</div>
+          </div>
+        }
+      </div>
+
+      <h3>类别比例：目标 vs 实际</h3>
+      <table class="data">
+        <thead>
+          <tr>
+            <th>类别</th><th>目标评测占比</th><th>实际评测占比</th><th>差异</th>
+            <th>train</th><th>eval</th><th>剔除</th><th>未决</th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (row of ratioEntries(); track row.label) {
+            <tr [class.bad]="row.stat.diff !== null && Math.abs(row.stat.diff) > 0.05">
+              <td>{{ row.label }}</td>
+              <td>{{ row.stat.target !== null ? (row.stat.target * 100).toFixed(0) + '%' : '—' }}</td>
+              <td>{{ row.stat.actual !== null ? (row.stat.actual * 100).toFixed(1) + '%' : '—' }}</td>
+              <td [class.pos]="row.stat.diff !== null && row.stat.diff > 0"
+                  [class.neg]="row.stat.diff !== null && row.stat.diff < 0">
+                @if (row.stat.diff !== null) {
+                  {{ row.stat.diff >= 0 ? '+' : '' }}{{ (row.stat.diff * 100).toFixed(1) }}%
+                } @else {
+                  —
+                }
+              </td>
+              <td>{{ row.stat.train }}</td>
+              <td>{{ row.stat.eval }}</td>
+              <td>{{ row.stat.excluded ?? 0 }}</td>
+              <td>{{ row.stat.unresolved ?? 0 }}</td>
+            </tr>
+          }
+        </tbody>
+      </table>
+
+      <h3>泄漏结论</h3>
+      <div
+        class="statement"
+        [class.safe]="result.buckets['unresolved'] === 0"
+        [class.caveat]="result.buckets['unresolved'] !== 0"
+      >
+        种子 <code>{{ result.seed }}</code> 已随本次拆分记录。<br />
+        {{ result.leakage_statement }}
+      </div>
+
+      @if (result.warnings.length) {
+        <h3>提示</h3>
+        <ul class="warnings">
+          @for (w of result.warnings; track w) {
+            <li>⚠️ {{ w }}</li>
+          }
+        </ul>
+      }
+
+      <div class="actions">
+        @if (!confirmed) {
+          <button class="confirm" (click)="confirm()">确认并保存清单与种子</button>
+        } @else {
+          <span class="confirmed-tag">✓ 已确认并持久化（run #{{ result.run_id }}，seed={{ result.seed }}）</span>
+        }
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>3. 按主体分组核查</h2>
+      <p class="hint">每个主体（含裁切/增强继承来的原始主体）只能出现在一个集合中。</p>
+      <div class="groups">
+        @for (g of subjectGroups; track g.subject) {
+          <div
+            class="group"
+            [class.leak]="g.hasLeak"
+            [class.unknown]="g.subject.startsWith('（')"
+          >
+            <div class="group-head">
+              <strong>{{ g.subject }}</strong>
+              @if (g.hasLeak) { <span class="pill bad">train+eval 泄漏!</span> }
+              @if (g.hasStraddle) { <span class="pill warn">跨时间分界</span> }
+              @if (g.buckets.has('unresolved')) { <span class="pill unknown">来源未确认</span> }
+              <span class="pill">{{ bucketList(g) }}</span>
+            </div>
+            <ul>
+              @for (a of g.assignments; track a.sample_id) {
+                <li>
+                  <span class="sid">{{ a.sample_id }}</span>
+                  <span class="mini" [class]="a.bucket">{{ bucketLabel(a.bucket) }}</span>
+                  @if (a.reason) { <em class="reason">{{ a.reason }}</em> }
+                </li>
+              }
+            </ul>
+          </div>
+        }
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>4. 冲突与原因</h2>
+      @if (result.conflicts.length === 0) {
+        <p>无冲突。</p>
+      }
+      @for (c of result.conflicts; track c.subject + c.conflict_type) {
+        <div class="conflict" [class]="c.severity">
+          <span class="conflict-icon">{{ conflictIcon(c) }}</span>
+          <div>
+            <strong>{{ c.subject ?? '（无主体）' }}</strong>
+            <code>{{ c.conflict_type }}</code>
+            <p>{{ c.detail }}</p>
+            @if (c.sample_ids.length) {
+              <small>涉及样本：{{ c.sample_ids.join(', ') }}</small>
+            }
+          </div>
+        </div>
+      }
+    </section>
+
+    <section class="card">
+      <h2>5. 每个样本的归属</h2>
+      <div class="filters">
+        @for (b of ['', 'train', 'eval', 'excluded', 'unresolved']; track b) {
+          <button
+            [class.active]="filterBucket === b"
+            (click)="filterBucket = b"
+          >{{ b === '' ? '全部' : bucketLabel(b) }}</button>
+        }
+      </div>
+      <table class="data">
+        <thead>
+          <tr><th>样本</th><th>类别</th><th>采集日期</th><th>类型</th><th>归属</th><th>原始主体</th><th>原因</th></tr>
+        </thead>
+        <tbody>
+          @for (a of filteredAssignments; track a.sample_id) {
+            @if (sampleOf(a.sample_id); as s) {
+              <tr>
+                <td class="sid">{{ s.id }}</td>
+                <td>{{ s.label }}</td>
+                <td>{{ s.captured_at }}</td>
+                <td>{{ s.kind }}@if (s.parent_id) { ← {{ s.parent_id }} }</td>
+                <td><span class="mini" [class]="a.bucket">{{ bucketLabel(a.bucket) }}</span></td>
+                <td>{{ a.root_subject ?? '—' }}</td>
+                <td class="reason-cell">{{ a.reason ?? '' }}</td>
+              </tr>
+            }
+          }
+        </tbody>
+      </table>
+    </section>
+  }
+
+  <section class="card">
+    <h2>样本清单（{{ samples.length }}）</h2>
+    @if (samples.length === 0) {
+      <p class="hint">清单为空。可用后端 <code>python -m app.seed_demo</code> 导入演示数据。</p>
+    } @else {
+      <table class="data compact">
+        <thead><tr><th>样本</th><th>类别</th><th>日期</th><th>主体</th><th>类型/来源</th></tr></thead>
+        <tbody>
+          @for (s of samples; track s.id) {
+            <tr>
+              <td class="sid">{{ s.id }}</td>
+              <td>{{ s.label }}</td>
+              <td>{{ s.captured_at }}</td>
+              <td>{{ s.subject_id ?? '—' }}</td>
+              <td>{{ s.kind }}@if (s.parent_id) { ← {{ s.parent_id }} }</td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    }
+  </section>
+</div>

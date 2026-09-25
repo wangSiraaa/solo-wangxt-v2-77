@@ -1,0 +1,4 @@
+/* Global resets */
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body { background: #f0f2f5; }
